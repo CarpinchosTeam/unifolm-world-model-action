@@ -9,6 +9,7 @@ import logging
 import einops
 import warnings
 import imageio
+import time
 
 from pytorch_lightning import seed_everything
 from omegaconf import OmegaConf
@@ -22,30 +23,57 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 
+# ─── Profiler imports ────────────────────────────────────────────────────────
+from torch.profiler import profile, record_function, ProfilerActivity
+# ─────────────────────────────────────────────────────────────────────────────
+
 from unifolm_wma.models.samplers.ddim import DDIMSampler
 from unifolm_wma.utils.utils import instantiate_from_config
 
 
+# ─── Simple wall-clock timer dict, accumulated across steps ──────────────────
+_TIMINGS: dict[str, list[float]] = {}
+
+class Timer:
+    """Context manager that accumulates wall-clock time by label."""
+    def __init__(self, label: str):
+        self.label = label
+
+    def __enter__(self):
+        torch.cuda.synchronize()   # flush GPU before starting clock
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *_):
+        torch.cuda.synchronize()   # flush GPU before stopping clock
+        elapsed = time.perf_counter() - self._t0
+        _TIMINGS.setdefault(self.label, []).append(elapsed)
+
+
+def print_timing_summary():
+    print("\n" + "=" * 60)
+    print("  WALL-CLOCK TIMING SUMMARY (averaged over profiled iters)")
+    print("=" * 60)
+    total = 0.0
+    rows = []
+    for label, times in _TIMINGS.items():
+        avg = sum(times) / len(times)
+        total += avg
+        rows.append((label, avg, len(times)))
+    rows.sort(key=lambda x: -x[1])
+    for label, avg, n in rows:
+        pct = 100 * avg / total if total > 0 else 0
+        print(f"  {label:<45} {avg:>7.3f}s  ({pct:>5.1f}%)  [n={n}]")
+    print(f"  {'TOTAL':<45} {total:>7.3f}s")
+    print("=" * 60 + "\n")
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def get_device_from_parameters(module: nn.Module) -> torch.device:
-    """Get a module's device by checking one of its parameters.
-
-    Args:
-        module (nn.Module): The model whose device is to be inferred.
-
-    Returns:
-        torch.device: The device of the model's parameters.
-    """
     return next(iter(module.parameters())).device
 
 
 def write_video(video_path: str, stacked_frames: list, fps: int) -> None:
-    """Save a list of frames to a video file.
-
-    Args:
-        video_path (str): Output path for the video.
-        stacked_frames (list): List of image frames.
-        fps (int): Frames per second for the video.
-    """
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore",
                                 "pkg_resources is deprecated as an API",
@@ -54,15 +82,6 @@ def write_video(video_path: str, stacked_frames: list, fps: int) -> None:
 
 
 def get_filelist(data_dir: str, postfixes: list[str]) -> list[str]:
-    """Return sorted list of files in a directory matching specified postfixes.
-
-    Args:
-        data_dir (str): Directory path to search in.
-        postfixes (list[str]): List of file extensions to match.
-
-    Returns:
-        list[str]: Sorted list of file paths.
-    """
     patterns = [
         os.path.join(data_dir, f"*.{postfix}") for postfix in postfixes
     ]
@@ -74,15 +93,6 @@ def get_filelist(data_dir: str, postfixes: list[str]) -> list[str]:
 
 
 def load_model_checkpoint(model: nn.Module, ckpt: str) -> nn.Module:
-    """Load model weights from checkpoint file.
-
-    Args:
-        model (nn.Module): Model instance.
-        ckpt (str): Path to the checkpoint file.
-
-    Returns:
-        nn.Module: Model with loaded weights.
-    """
     state_dict = torch.load(ckpt, map_location="cpu")
     if "state_dict" in list(state_dict.keys()):
         state_dict = state_dict["state_dict"]
@@ -109,28 +119,12 @@ def load_model_checkpoint(model: nn.Module, ckpt: str) -> nn.Module:
 
 
 def is_inferenced(save_dir: str, filename: str) -> bool:
-    """Check if a given filename has already been processed and saved.
-
-    Args:
-        save_dir (str): Directory where results are saved.
-        filename (str): Name of the file to check.
-
-    Returns:
-        bool: True if processed file exists, False otherwise.
-    """
     video_file = os.path.join(save_dir, "samples_separate",
                               f"{filename[:-4]}_sample0.mp4")
     return os.path.exists(video_file)
 
 
 def save_results(video: Tensor, filename: str, fps: int = 8) -> None:
-    """Save video tensor to file using torchvision.
-
-    Args:
-        video (Tensor): Tensor of shape (B, C, T, H, W).
-        filename (str): Output file path.
-        fps (int, optional): Frames per second. Defaults to 8.
-    """
     video = video.detach().cpu()
     video = torch.clamp(video.float(), -1., 1.)
     n = video.shape[0]
@@ -151,15 +145,6 @@ def save_results(video: Tensor, filename: str, fps: int = 8) -> None:
 
 
 def get_init_frame_path(data_dir: str, sample: dict) -> str:
-    """Construct the init_frame path from directory and sample metadata.
-
-    Args:
-        data_dir (str): Base directory containing videos.
-        sample (dict): Dictionary containing 'data_dir' and 'videoid'.
-
-    Returns:
-        str: Full path to the video file.
-    """
     rel_video_fp = os.path.join(sample['data_dir'],
                                 str(sample['videoid']) + '.png')
     full_image_fp = os.path.join(data_dir, 'images', rel_video_fp)
@@ -167,15 +152,6 @@ def get_init_frame_path(data_dir: str, sample: dict) -> str:
 
 
 def get_transition_path(data_dir: str, sample: dict) -> str:
-    """Construct the full transition file path from directory and sample metadata.
-
-    Args:
-        data_dir (str): Base directory containing transition files.
-        sample (dict): Dictionary containing 'data_dir' and 'videoid'.
-
-    Returns:
-        str: Full path to the HDF5 transition file.
-    """
     rel_transition_fp = os.path.join(sample['data_dir'],
                                      str(sample['videoid']) + '.h5')
     full_transition_fp = os.path.join(data_dir, 'transitions',
@@ -223,7 +199,6 @@ def prepare_init_input(start_idx: int,
         states = transition_dict['observation.state'][state_indices, :]
 
     actions = transition_dict['action'][indices, :]
-
     ori_state_dim = states.shape[-1]
     ori_action_dim = actions.shape[-1]
 
@@ -250,16 +225,6 @@ def prepare_init_input(start_idx: int,
 
 
 def get_latent_z(model, videos: Tensor) -> Tensor:
-    """
-    Extracts latent features from a video batch using the model's first-stage encoder.
-
-    Args:
-        model: the world model.
-        videos (Tensor): Input videos of shape [B, C, T, H, W].
-
-    Returns:
-        Tensor: Latent video tensor of shape [B, C, T, H, W].
-    """
     b, c, t, h, w = videos.shape
     x = rearrange(videos, 'b c t h w -> (b t) c h w')
     z = model.encode_first_stage(x)
@@ -267,17 +232,8 @@ def get_latent_z(model, videos: Tensor) -> Tensor:
     return z
 
 
-def preprocess_observation(
-        model, observations: dict[str, np.ndarray]) -> dict[str, Tensor]:
-    """Convert environment observation to LeRobot format observation.
-    Args:
-        observation: Dictionary of observation batches from a Gym vector environment.
-    Returns:
-        Dictionary of observation batches with keys renamed to LeRobot format and values as tensors.
-    """
-    # Map to expected inputs for the policy
+def preprocess_observation(model, observations):
     return_observations = {}
-
     if isinstance(observations["pixels"], dict):
         imgs = {
             f"observation.images.{key}": img
@@ -288,8 +244,6 @@ def preprocess_observation(
 
     for imgkey, img in imgs.items():
         img = torch.from_numpy(img)
-
-        # Sanity check that images are channel last
         _, h, w, c = img.shape
         assert c < h and c < w, f"expect channel first images, but instead {img.shape}"
 
@@ -299,7 +253,6 @@ def preprocess_observation(
         # Convert to channel first of type float32 in range [0,1]
         img = einops.rearrange(img, "b h w c -> b c h w").contiguous()
         img = img.type(torch.float32)
-
         return_observations[imgkey] = img
 
     return_observations["observation.state"] = torch.from_numpy(
@@ -308,86 +261,49 @@ def preprocess_observation(
         'observation.state':
         return_observations['observation.state'].to(model.device)
     })['observation.state']
-
     return return_observations
 
 
 def image_guided_synthesis_sim_mode(
-        model: torch.nn.Module,
-        prompts: list[str],
-        observation: dict,
-        noise_shape: tuple[int, int, int, int, int],
-        action_cond_step: int = 16,
-        n_samples: int = 1,
-        ddim_steps: int = 50,
-        ddim_eta: float = 1.0,
-        unconditional_guidance_scale: float = 1.0,
-        fs: int | None = None,
-        text_input: bool = True,
-        timestep_spacing: str = 'uniform',
-        guidance_rescale: float = 0.0,
-        sim_mode: bool = True,
-        **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Performs image-guided video generation in a simulation-style mode with optional multimodal guidance (image, state, action, text).
+        model, prompts, observation, noise_shape,
+        action_cond_step=16, n_samples=1, ddim_steps=50,
+        ddim_eta=1.0, unconditional_guidance_scale=1.0,
+        fs=None, text_input=True, timestep_spacing='uniform',
+        guidance_rescale=0.0, sim_mode=True, **kwargs):
 
-    Args:
-        model (torch.nn.Module): The diffusion-based generative model with multimodal conditioning.
-        prompts (list[str]): A list of textual prompts to guide the synthesis process.
-        observation (dict): A dictionary containing observed inputs including:
-            - 'observation.images.top': Tensor of shape [B, O, C, H, W] (top-down images)
-            - 'observation.state': Tensor of shape [B, O, D] (state vector)
-            - 'action': Tensor of shape [B, T, D] (action sequence)
-        noise_shape (tuple[int, int, int, int, int]): Shape of the latent variable to generate, 
-            typically (B, C, T, H, W).
-        action_cond_step (int): Number of time steps where action conditioning is applied. Default is 16.
-        n_samples (int): Number of samples to generate (unused here, always generates 1). Default is 1.
-        ddim_steps (int): Number of DDIM sampling steps. Default is 50.
-        ddim_eta (float): DDIM eta parameter controlling the stochasticity. Default is 1.0.
-        unconditional_guidance_scale (float): Scale for classifier-free guidance. If 1.0, guidance is off.
-        fs (int | None): Frame index to condition on, broadcasted across the batch if specified. Default is None.
-        text_input (bool): Whether to use text prompt as conditioning. If False, uses empty strings. Default is True.
-        timestep_spacing (str): Timestep sampling method in DDIM sampler. Typically "uniform" or "linspace".
-        guidance_rescale (float): Guidance rescaling factor to mitigate overexposure from classifier-free guidance.
-        sim_mode (bool): Whether to perform world-model interaction or decision-making using the world-model.
-        **kwargs: Additional arguments passed to the DDIM sampler.
-
-    Returns:
-        batch_variants (torch.Tensor): Predicted pixel-space video frames [B, C, T, H, W].
-        actions (torch.Tensor): Predicted action sequences [B, T, D] from diffusion decoding.
-        states (torch.Tensor): Predicted state sequences [B, T, D] from diffusion decoding.
-    """
     b, _, t, _, _ = noise_shape
     ddim_sampler = DDIMSampler(model)
     batch_size = noise_shape[0]
-
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
 
-    img = observation['observation.images.top'].permute(0, 2, 1, 3, 4)
-    cond_img = rearrange(img, 'b o c h w -> (b o) c h w')[-1:]
-    cond_img_emb = model.embedder(cond_img)
-    cond_img_emb = model.image_proj_model(cond_img_emb)
+    # ── Conditioning build-up ─────────────────────────────────────────────────
+    with record_function("cond/image_embedding"):
+        img = observation['observation.images.top'].permute(0, 2, 1, 3, 4)
+        cond_img = rearrange(img, 'b o c h w -> (b o) c h w')[-1:]
+        cond_img_emb = model.embedder(cond_img)
+        cond_img_emb = model.image_proj_model(cond_img_emb)
 
-    if model.model.conditioning_key == 'hybrid':
-        z = get_latent_z(model, img.permute(0, 2, 1, 3, 4))
-        img_cat_cond = z[:, :, -1:, :, :]
-        img_cat_cond = repeat(img_cat_cond,
-                              'b c t h w -> b c (repeat t) h w',
-                              repeat=noise_shape[2])
-        cond = {"c_concat": [img_cat_cond]}
+    with record_function("cond/vae_encode"):
+        if model.model.conditioning_key == 'hybrid':
+            z = get_latent_z(model, img.permute(0, 2, 1, 3, 4))
+            img_cat_cond = z[:, :, -1:, :, :]
+            img_cat_cond = repeat(img_cat_cond,
+                                  'b c t h w -> b c (repeat t) h w',
+                                  repeat=noise_shape[2])
+            cond = {"c_concat": [img_cat_cond]}
 
-    if not text_input:
-        prompts = [""] * batch_size
-    cond_ins_emb = model.get_learned_conditioning(prompts)
+    with record_function("cond/text_conditioning"):
+        if not text_input:
+            prompts = [""] * batch_size
+        cond_ins_emb = model.get_learned_conditioning(prompts)
 
-    cond_state_emb = model.state_projector(observation['observation.state'])
-    cond_state_emb = cond_state_emb + model.agent_state_pos_emb
-
-    cond_action_emb = model.action_projector(observation['action'])
-    cond_action_emb = cond_action_emb + model.agent_action_pos_emb
-
-    if not sim_mode:
-        cond_action_emb = torch.zeros_like(cond_action_emb)
+    with record_function("cond/state_action_projection"):
+        cond_state_emb = model.state_projector(observation['observation.state'])
+        cond_state_emb = cond_state_emb + model.agent_state_pos_emb
+        cond_action_emb = model.action_projector(observation['action'])
+        cond_action_emb = cond_action_emb + model.agent_action_pos_emb
+        if not sim_mode:
+            cond_action_emb = torch.zeros_like(cond_action_emb)
 
     cond["c_crossattn"] = [
         torch.cat(
@@ -395,8 +311,7 @@ def image_guided_synthesis_sim_mode(
             dim=1)
     ]
     cond["c_crossattn_action"] = [
-        observation['observation.images.top'][:, :,
-                                              -model.n_obs_steps_acting:],
+        observation['observation.images.top'][:, :, -model.n_obs_steps_acting:],
         observation['observation.state'][:, -model.n_obs_steps_acting:],
         sim_mode,
         False,
@@ -404,9 +319,9 @@ def image_guided_synthesis_sim_mode(
 
     uc = None
     kwargs.update({"unconditional_conditioning_img_nonetext": None})
-    cond_mask = None
-    cond_z0 = None
-    if ddim_sampler is not None:
+
+    # ── DDIM sampling (the expensive part) ───────────────────────────────────
+    with record_function("ddim_sampling"):
         samples, actions, states, intermedia = ddim_sampler.sample(
             S=ddim_steps,
             conditioning=cond,
@@ -417,46 +332,40 @@ def image_guided_synthesis_sim_mode(
             unconditional_conditioning=uc,
             eta=ddim_eta,
             cfg_img=None,
-            mask=cond_mask,
-            x0=cond_z0,
+            mask=None,
+            x0=None,
             fs=fs,
             timestep_spacing=timestep_spacing,
             guidance_rescale=guidance_rescale,
             **kwargs)
 
-        # Reconstruct from latent to pixel space
+    # ── VAE decode ────────────────────────────────────────────────────────────
+    with record_function("vae_decode"):
         batch_images = model.decode_first_stage(samples)
-        batch_variants = batch_images
 
-    return batch_variants, actions, states
+    return batch_images, actions, states
 
 
 def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
-    """
-    Run inference pipeline on prompts and image inputs.
+    # ── Profiling config ──────────────────────────────────────────────────────
+    # We profile only PROFILE_ITERS iterations then print stats and continue
+    # normally (no trace saved to disk to avoid OOM).
+    PROFILE_ITERS = 2          # how many iters to profile (keep small!)
+    WARMUP_ITERS  = 1          # iters to skip before profiling starts
+    SAVE_TRACE    = True      # set True only if you have plenty of disk/RAM
+    TRACE_PATH    = "./profiler_trace.json"   # only used if SAVE_TRACE=True
+    # ─────────────────────────────────────────────────────────────────────────
 
-    Args:
-        args (argparse.Namespace): Parsed command-line arguments.
-        gpu_num (int): Number of GPUs.
-        gpu_no (int): Index of the current GPU.
-
-    Returns:
-        None
-    """
-    # Create inference and tensorboard dirs
     os.makedirs(args.savedir + '/inference', exist_ok=True)
     log_dir = args.savedir + f"/tensorboard"
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
 
-    # Load prompt
     csv_path = os.path.join(args.prompt_dir, f"{args.dataset}.csv")
     df = pd.read_csv(csv_path)
 
-    # Load config
     config = OmegaConf.load(args.config)
-    config['model']['params']['wma_config']['params'][
-        'use_checkpoint'] = False
+    config['model']['params']['wma_config']['params']['use_checkpoint'] = False
     model = instantiate_from_config(config.model)
     model.perframe_ae = args.perframe_ae
     assert os.path.exists(args.ckpt_path), "Error: checkpoint Not Found!"
@@ -464,7 +373,6 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     model.eval()
     print(f'>>> Load pre-trained model ...')
 
-    # Build unnomalizer
     logging.info("***** Configing Data *****")
     data = instantiate_from_config(config.data)
     data.setup()
@@ -473,24 +381,17 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     model = model.cuda(gpu_no)
     device = get_device_from_parameters(model)
 
-    # Run over data
-    assert (args.height % 16 == 0) and (
-        args.width % 16
-        == 0), "Error: image size [h,w] should be multiples of 16!"
-    assert args.bs == 1, "Current implementation only support [batch size = 1]!"
+    assert (args.height % 16 == 0) and (args.width % 16 == 0)
+    assert args.bs == 1
 
-    # Get latent noise shape
     h, w = args.height // 8, args.width // 8
     channels = model.model.diffusion_model.out_channels
     n_frames = args.video_length
-    print(f'>>> Generate {n_frames} frames under each generation ...')
+    print(f'>>> Generate {n_frames} frames per generation ...')
     noise_shape = [args.bs, channels, n_frames, h, w]
 
-    # Start inference
     for idx in range(0, len(df)):
         sample = df.iloc[idx]
-
-        # Got initial frame path
         init_frame_path = get_init_frame_path(args.prompt_dir, sample)
         ori_fps = float(sample['fps'])
 
@@ -499,7 +400,6 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
         os.makedirs(video_save_dir + '/dm', exist_ok=True)
         os.makedirs(video_save_dir + '/wm', exist_ok=True)
 
-        # Load transitions to get the initial state later
         transition_path = get_transition_path(args.prompt_dir, sample)
         with h5py.File(transition_path, 'r') as h5f:
             transition_dict = {}
@@ -508,296 +408,235 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
             for key in h5f.attrs.keys():
                 transition_dict[key] = h5f.attrs[key]
 
-        # If many, test various frequence control and world-model generation
         for fs in args.frame_stride:
-
-            # For saving imagens in policy
             sample_save_dir = f'{video_save_dir}/dm/{fs}'
             os.makedirs(sample_save_dir, exist_ok=True)
-            # For saving environmental changes in world-model
             sample_save_dir = f'{video_save_dir}/wm/{fs}'
             os.makedirs(sample_save_dir, exist_ok=True)
-            # For collecting interaction videos
             wm_video = []
-            # Initialize observation queues
+
             cond_obs_queues = {
-                "observation.images.top":
-                deque(maxlen=model.n_obs_steps_imagen),
-                "observation.state": deque(maxlen=model.n_obs_steps_imagen),
-                "action": deque(maxlen=args.video_length),
+                "observation.images.top": deque(maxlen=model.n_obs_steps_imagen),
+                "observation.state":      deque(maxlen=model.n_obs_steps_imagen),
+                "action":                 deque(maxlen=args.video_length),
             }
-            # Obtain initial frame and state
+
             start_idx = 0
             model_input_fs = ori_fps // fs
             batch, ori_state_dim, ori_action_dim = prepare_init_input(
-                start_idx,
-                init_frame_path,
-                transition_dict,
-                fs,
+                start_idx, init_frame_path, transition_dict, fs,
                 data.test_datasets[args.dataset],
                 n_obs_steps=model.n_obs_steps_imagen)
+
             observation = {
                 'observation.images.top':
-                batch['observation.image'].permute(1, 0, 2,
-                                                   3)[-1].unsqueeze(0),
+                    batch['observation.image'].permute(1, 0, 2, 3)[-1].unsqueeze(0),
                 'observation.state':
-                batch['observation.state'][-1].unsqueeze(0),
+                    batch['observation.state'][-1].unsqueeze(0),
                 'action':
-                torch.zeros_like(batch['action'][-1]).unsqueeze(0)
+                    torch.zeros_like(batch['action'][-1]).unsqueeze(0)
             }
             observation = {
-                key: observation[key].to(device, non_blocking=True)
-                for key in observation
+                k: v.to(device, non_blocking=True) for k, v in observation.items()
             }
-            # Update observation queues
             cond_obs_queues = populate_queues(cond_obs_queues, observation)
 
-            # Multi-round interaction with the world-model
+            # ── Build the profiler (only captures PROFILE_ITERS active steps) ──
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                # wait=warmup, warmup=1 (jit flush), active=profile, repeat=1 then stops
+                schedule=torch.profiler.schedule(
+                    wait=WARMUP_ITERS,
+                    warmup=1,
+                    active=PROFILE_ITERS,
+                    repeat=1,
+                ),
+                # on_trace_ready fires once per (wait+warmup+active) cycle
+                on_trace_ready=None,   # we print manually below
+            )
+            prof.start()
+            profiling_done = False
+            # ─────────────────────────────────────────────────────────────────
+
             for itr in tqdm(range(args.n_iter)):
 
-                # Get observation
                 observation = {
                     'observation.images.top':
-                    torch.stack(list(
-                        cond_obs_queues['observation.images.top']),
-                                dim=1).permute(0, 2, 1, 3, 4),
+                        torch.stack(list(cond_obs_queues['observation.images.top']), dim=1)
+                             .permute(0, 2, 1, 3, 4),
                     'observation.state':
-                    torch.stack(list(cond_obs_queues['observation.state']),
-                                dim=1),
+                        torch.stack(list(cond_obs_queues['observation.state']), dim=1),
                     'action':
-                    torch.stack(list(cond_obs_queues['action']), dim=1),
+                        torch.stack(list(cond_obs_queues['action']), dim=1),
                 }
                 observation = {
-                    key: observation[key].to(device, non_blocking=True)
-                    for key in observation
+                    k: v.to(device, non_blocking=True) for k, v in observation.items()
                 }
 
-                # Use world-model in policy to generate action
+                # ── Decision-making pass ──────────────────────────────────────
                 print(f'>>> Step {itr}: generating actions ...')
-                pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
-                    model,
-                    sample['instruction'],
-                    observation,
-                    noise_shape,
-                    action_cond_step=args.exe_steps,
-                    ddim_steps=args.ddim_steps,
-                    ddim_eta=args.ddim_eta,
-                    unconditional_guidance_scale=args.
-                    unconditional_guidance_scale,
-                    fs=model_input_fs,
-                    timestep_spacing=args.timestep_spacing,
-                    guidance_rescale=args.guidance_rescale,
-                    sim_mode=False)
+                with record_function("DM_pass"):
+                    with Timer("DM: full decision-making pass"):
+                        with Timer("DM: image_guided_synthesis"):
+                            pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
+                                model, sample['instruction'], observation,
+                                noise_shape,
+                                action_cond_step=args.exe_steps,
+                                ddim_steps=args.ddim_steps,
+                                ddim_eta=args.ddim_eta,
+                                unconditional_guidance_scale=args.unconditional_guidance_scale,
+                                fs=model_input_fs,
+                                timestep_spacing=args.timestep_spacing,
+                                guidance_rescale=args.guidance_rescale,
+                                sim_mode=False)
 
-                # Update future actions in the observation queues
-                for idx in range(len(pred_actions[0])):
-                    observation = {'action': pred_actions[0][idx:idx + 1]}
-                    observation['action'][:, ori_action_dim:] = 0.0
-                    cond_obs_queues = populate_queues(cond_obs_queues,
-                                                      observation)
+                # ── Update action queues ──────────────────────────────────────
+                with record_function("queue_update_actions"):
+                    for aidx in range(len(pred_actions[0])):
+                        obs_a = {'action': pred_actions[0][aidx:aidx + 1]}
+                        obs_a['action'][:, ori_action_dim:] = 0.0
+                        cond_obs_queues = populate_queues(cond_obs_queues, obs_a)
 
-                # Collect data for interacting the world-model using the predicted actions
                 observation = {
                     'observation.images.top':
-                    torch.stack(list(
-                        cond_obs_queues['observation.images.top']),
-                                dim=1).permute(0, 2, 1, 3, 4),
+                        torch.stack(list(cond_obs_queues['observation.images.top']), dim=1)
+                             .permute(0, 2, 1, 3, 4),
                     'observation.state':
-                    torch.stack(list(cond_obs_queues['observation.state']),
-                                dim=1),
+                        torch.stack(list(cond_obs_queues['observation.state']), dim=1),
                     'action':
-                    torch.stack(list(cond_obs_queues['action']), dim=1),
+                        torch.stack(list(cond_obs_queues['action']), dim=1),
                 }
                 observation = {
-                    key: observation[key].to(device, non_blocking=True)
-                    for key in observation
+                    k: v.to(device, non_blocking=True) for k, v in observation.items()
                 }
 
-                # Interaction with the world-model
+                # ── World-model interaction pass ──────────────────────────────
                 print(f'>>> Step {itr}: interacting with world model ...')
-                pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
-                    model,
-                    "",
-                    observation,
-                    noise_shape,
-                    action_cond_step=args.exe_steps,
-                    ddim_steps=args.ddim_steps,
-                    ddim_eta=args.ddim_eta,
-                    unconditional_guidance_scale=args.
-                    unconditional_guidance_scale,
-                    fs=model_input_fs,
-                    text_input=False,
-                    timestep_spacing=args.timestep_spacing,
-                    guidance_rescale=args.guidance_rescale)
+                with record_function("WM_pass"):
+                    with Timer("WM: full world-model pass"):
+                        with Timer("WM: image_guided_synthesis"):
+                            pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
+                                model, "", observation, noise_shape,
+                                action_cond_step=args.exe_steps,
+                                ddim_steps=args.ddim_steps,
+                                ddim_eta=args.ddim_eta,
+                                unconditional_guidance_scale=args.unconditional_guidance_scale,
+                                fs=model_input_fs,
+                                text_input=False,
+                                timestep_spacing=args.timestep_spacing,
+                                guidance_rescale=args.guidance_rescale)
 
-                for idx in range(args.exe_steps):
-                    observation = {
-                        'observation.images.top':
-                        pred_videos_1[0][:, idx:idx + 1].permute(1, 0, 2, 3),
-                        'observation.state':
-                        torch.zeros_like(pred_states[0][idx:idx + 1]) if
-                        args.zero_pred_state else pred_states[0][idx:idx + 1],
-                        'action':
-                        torch.zeros_like(pred_actions[0][-1:])
-                    }
-                    observation['observation.state'][:, ori_state_dim:] = 0.0
-                    cond_obs_queues = populate_queues(cond_obs_queues,
-                                                      observation)
+                # ── Update obs queues from world-model output ─────────────────
+                with record_function("queue_update_obs"):
+                    with Timer("queue: update from WM output"):
+                        for eidx in range(args.exe_steps):
+                            obs_wm = {
+                                'observation.images.top':
+                                    pred_videos_1[0][:, eidx:eidx + 1].permute(1, 0, 2, 3),
+                                'observation.state':
+                                    torch.zeros_like(pred_states[0][eidx:eidx + 1])
+                                    if args.zero_pred_state
+                                    else pred_states[0][eidx:eidx + 1],
+                                'action':
+                                    torch.zeros_like(pred_actions[0][-1:])
+                            }
+                            obs_wm['observation.state'][:, ori_state_dim:] = 0.0
+                            cond_obs_queues = populate_queues(cond_obs_queues, obs_wm)
 
-                # Save the imagen videos for decision-making
-                sample_tag = f"{args.dataset}-vid{sample['videoid']}-dm-fs-{fs}/itr-{itr}"
-                log_to_tensorboard(writer,
-                                   pred_videos_0,
-                                   sample_tag,
-                                   fps=args.save_fps)
-                # Save videos environment changes via world-model interaction
-                sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/itr-{itr}"
-                log_to_tensorboard(writer,
-                                   pred_videos_1,
-                                   sample_tag,
-                                   fps=args.save_fps)
+                # ── Save results ──────────────────────────────────────────────
+                with record_function("save_results"):
+                    with Timer("IO: tensorboard + video save"):
+                        sample_tag = f"{args.dataset}-vid{sample['videoid']}-dm-fs-{fs}/itr-{itr}"
+                        log_to_tensorboard(writer, pred_videos_0, sample_tag, fps=args.save_fps)
+                        sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/itr-{itr}"
+                        log_to_tensorboard(writer, pred_videos_1, sample_tag, fps=args.save_fps)
 
-                # Save the imagen videos for decision-making
-                sample_video_file = f'{video_save_dir}/dm/{fs}/itr-{itr}.mp4'
-                save_results(pred_videos_0.cpu(),
-                             sample_video_file,
-                             fps=args.save_fps)
-                # Save videos environment changes via world-model interaction
-                sample_video_file = f'{video_save_dir}/wm/{fs}/itr-{itr}.mp4'
-                save_results(pred_videos_1.cpu(),
-                             sample_video_file,
-                             fps=args.save_fps)
+                        save_results(pred_videos_0.cpu(),
+                                     f'{video_save_dir}/dm/{fs}/itr-{itr}.mp4',
+                                     fps=args.save_fps)
+                        save_results(pred_videos_1.cpu(),
+                                     f'{video_save_dir}/wm/{fs}/itr-{itr}.mp4',
+                                     fps=args.save_fps)
+
+                wm_video.append(pred_videos_1[:, :, :args.exe_steps].cpu())
+
+                # ── Advance profiler schedule ─────────────────────────────────
+                prof.step()
+
+                # After (WARMUP_ITERS + 1 + PROFILE_ITERS) total steps, print and stop
+                _profile_trigger = WARMUP_ITERS + 1 + PROFILE_ITERS
+                if itr == _profile_trigger - 1 and not profiling_done:
+                    prof.stop()
+                    profiling_done = True
+
+                    print("\n" + "=" * 60)
+                    print("  TORCH PROFILER — TOP CUDA OPS")
+                    print("=" * 60)
+                    print(prof.key_averages().table(
+                        sort_by="cuda_time_total",
+                        row_limit=25,
+                    ))
+
+                    print("\n" + "=" * 60)
+                    print("  TORCH PROFILER — TOP CPU OPS")
+                    print("=" * 60)
+                    print(prof.key_averages().table(
+                        sort_by="cpu_time_total",
+                        row_limit=15,
+                    ))
+
+                    print("\n" + "=" * 60)
+                    print("  TORCH PROFILER — MEMORY (GPU)")
+                    print("=" * 60)
+                    print(prof.key_averages().table(
+                        sort_by="self_cuda_memory_usage",
+                        row_limit=15,
+                    ))
+
+                    if SAVE_TRACE:
+                        prof.export_chrome_trace(TRACE_PATH)
+                        print(f"\n  Chrome trace saved → {TRACE_PATH}")
+                        print("  Open at: https://ui.perfetto.dev\n")
+
+                    print_timing_summary()
 
                 print('>' * 24)
-                # Collect the result of world-model interactions
-                wm_video.append(pred_videos_1[:, :, :args.exe_steps].cpu())
 
             full_video = torch.cat(wm_video, dim=2)
             sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/full"
-            log_to_tensorboard(writer,
-                               full_video,
-                               sample_tag,
-                               fps=args.save_fps)
-            sample_full_video_file = f"{video_save_dir}/../{sample['videoid']}_full_fs{fs}.mp4"
-            save_results(full_video, sample_full_video_file, fps=args.save_fps)
+            log_to_tensorboard(writer, full_video, sample_tag, fps=args.save_fps)
+            save_results(full_video,
+                         f"{video_save_dir}/../{sample['videoid']}_full_fs{fs}.mp4",
+                         fps=args.save_fps)
 
 
 def get_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--savedir",
-                        type=str,
-                        default=None,
-                        help="Path to save the results.")
-    parser.add_argument("--ckpt_path",
-                        type=str,
-                        default=None,
-                        help="Path to the model checkpoint.")
-    parser.add_argument("--config",
-                        type=str,
-                        help="Path to the model checkpoint.")
-    parser.add_argument(
-        "--prompt_dir",
-        type=str,
-        default=None,
-        help="Directory containing videos and corresponding prompts.")
-    parser.add_argument("--dataset",
-                        type=str,
-                        default=None,
-                        help="the name of dataset to test")
-    parser.add_argument(
-        "--ddim_steps",
-        type=int,
-        default=50,
-        help="Number of DDIM steps. If non-positive, DDPM is used instead.")
-    parser.add_argument(
-        "--ddim_eta",
-        type=float,
-        default=1.0,
-        help="Eta for DDIM sampling. Set to 0.0 for deterministic results.")
-    parser.add_argument("--bs",
-                        type=int,
-                        default=1,
-                        help="Batch size for inference. Must be 1.")
-    parser.add_argument("--height",
-                        type=int,
-                        default=320,
-                        help="Height of the generated images in pixels.")
-    parser.add_argument("--width",
-                        type=int,
-                        default=512,
-                        help="Width of the generated images in pixels.")
-    parser.add_argument(
-        "--frame_stride",
-        type=int,
-        nargs='+',
-        required=True,
-        help=
-        "frame stride control for 256 model (larger->larger motion), FPS control for 512 or 1024 model (smaller->larger motion)"
-    )
-    parser.add_argument(
-        "--unconditional_guidance_scale",
-        type=float,
-        default=1.0,
-        help="Scale for classifier-free guidance during sampling.")
-    parser.add_argument("--seed",
-                        type=int,
-                        default=123,
-                        help="Random seed for reproducibility.")
-    parser.add_argument("--video_length",
-                        type=int,
-                        default=16,
-                        help="Number of frames in the generated video.")
-    parser.add_argument("--num_generation",
-                        type=int,
-                        default=1,
-                        help="seed for seed_everything")
-    parser.add_argument(
-        "--timestep_spacing",
-        type=str,
-        default="uniform",
-        help=
-        "Strategy for timestep scaling. See Table 2 in the paper: 'Common Diffusion Noise Schedules and Sample Steps are Flawed' (https://huggingface.co/papers/2305.08891)."
-    )
-    parser.add_argument(
-        "--guidance_rescale",
-        type=float,
-        default=0.0,
-        help=
-        "Rescale factor for guidance as discussed in 'Common Diffusion Noise Schedules and Sample Steps are Flawed' (https://huggingface.co/papers/2305.08891)."
-    )
-    parser.add_argument(
-        "--perframe_ae",
-        action='store_true',
-        default=False,
-        help=
-        "Use per-frame autoencoder decoding to reduce GPU memory usage. Recommended for models with resolutions like 576x1024."
-    )
-    parser.add_argument(
-        "--n_action_steps",
-        type=int,
-        default=16,
-        help="num of samples per prompt",
-    )
-    parser.add_argument(
-        "--exe_steps",
-        type=int,
-        default=16,
-        help="num of samples to execute",
-    )
-    parser.add_argument(
-        "--n_iter",
-        type=int,
-        default=40,
-        help="num of iteration to interact with the world model",
-    )
-    parser.add_argument("--zero_pred_state",
-                        action='store_true',
-                        default=False,
-                        help="not using the predicted states as comparison")
-    parser.add_argument("--save_fps",
-                        type=int,
-                        default=8,
-                        help="fps for the saving video")
+    parser.add_argument("--savedir", type=str, default=None)
+    parser.add_argument("--ckpt_path", type=str, default=None)
+    parser.add_argument("--config", type=str)
+    parser.add_argument("--prompt_dir", type=str, default=None)
+    parser.add_argument("--dataset", type=str, default=None)
+    parser.add_argument("--ddim_steps", type=int, default=50)
+    parser.add_argument("--ddim_eta", type=float, default=1.0)
+    parser.add_argument("--bs", type=int, default=1)
+    parser.add_argument("--height", type=int, default=320)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--frame_stride", type=int, nargs='+', required=True)
+    parser.add_argument("--unconditional_guidance_scale", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--video_length", type=int, default=16)
+    parser.add_argument("--num_generation", type=int, default=1)
+    parser.add_argument("--timestep_spacing", type=str, default="uniform")
+    parser.add_argument("--guidance_rescale", type=float, default=0.0)
+    parser.add_argument("--perframe_ae", action='store_true', default=False)
+    parser.add_argument("--n_action_steps", type=int, default=16)
+    parser.add_argument("--exe_steps", type=int, default=16)
+    parser.add_argument("--n_iter", type=int, default=40)
+    parser.add_argument("--zero_pred_state", action='store_true', default=False)
+    parser.add_argument("--save_fps", type=int, default=8)
     return parser
 
 
