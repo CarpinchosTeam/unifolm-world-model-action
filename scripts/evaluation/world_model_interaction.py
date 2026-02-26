@@ -261,7 +261,8 @@ def get_latent_z(model, videos: Tensor) -> Tensor:
         Tensor: Latent video tensor of shape [B, C, T, H, W].
     """
     b, c, t, h, w = videos.shape
-    x = rearrange(videos, 'b c t h w -> (b t) c h w')
+    # Ensure input is float32 for the VAE encoder
+    x = rearrange(videos, 'b c t h w -> (b t) c h w').to(torch.float32)
     z = model.encode_first_stage(x)
     z = rearrange(z, '(b t) c h w -> b c t h w', b=b, t=t)
     return z
@@ -363,69 +364,70 @@ def image_guided_synthesis_sim_mode(
 
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
 
-    img = observation['observation.images.top'].permute(0, 2, 1, 3, 4)
-    cond_img = rearrange(img, 'b o c h w -> (b o) c h w')[-1:]
-    cond_img_emb = model.embedder(cond_img)
-    cond_img_emb = model.image_proj_model(cond_img_emb)
+    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
 
-    if model.model.conditioning_key == 'hybrid':
-        z = get_latent_z(model, img.permute(0, 2, 1, 3, 4))
-        img_cat_cond = z[:, :, -1:, :, :]
-        img_cat_cond = repeat(img_cat_cond,
+        img = observation['observation.images.top'].permute(0, 2, 1, 3, 4)
+        cond_img = rearrange(img, 'b o c h w -> (b o) c h w')[-1:].to(torch.bfloat16)
+        cond_img_emb = model.embedder(cond_img)
+        cond_img_emb = model.image_proj_model(cond_img_emb)
+
+        if model.model.conditioning_key == 'hybrid':
+            z = get_latent_z(model, img.permute(0, 2, 1, 3, 4))
+            img_cat_cond = z[:, :, -1:, :, :].to(torch.bfloat16)
+            img_cat_cond = repeat(img_cat_cond,
                               'b c t h w -> b c (repeat t) h w',
                               repeat=noise_shape[2])
-        cond = {"c_concat": [img_cat_cond]}
-
-    if not text_input:
-        prompts = [""] * batch_size
-    cond_ins_emb = model.get_learned_conditioning(prompts)
-
-    cond_state_emb = model.state_projector(observation['observation.state'])
-    cond_state_emb = cond_state_emb + model.agent_state_pos_emb
-
-    cond_action_emb = model.action_projector(observation['action'])
-    cond_action_emb = cond_action_emb + model.agent_action_pos_emb
-
-    if not sim_mode:
-        cond_action_emb = torch.zeros_like(cond_action_emb)
-
-    cond["c_crossattn"] = [
-        torch.cat(
-            [cond_state_emb, cond_action_emb, cond_ins_emb, cond_img_emb],
-            dim=1)
-    ]
-    cond["c_crossattn_action"] = [
-        observation['observation.images.top'][:, :,
-                                              -model.n_obs_steps_acting:],
-        observation['observation.state'][:, -model.n_obs_steps_acting:],
-        sim_mode,
-        False,
-    ]
-
-    uc = None
-    kwargs.update({"unconditional_conditioning_img_nonetext": None})
-    cond_mask = None
-    cond_z0 = None
-    if ddim_sampler is not None:
-        samples, actions, states, intermedia = ddim_sampler.sample(
-            S=ddim_steps,
-            conditioning=cond,
-            batch_size=batch_size,
-            shape=noise_shape[1:],
-            verbose=False,
-            unconditional_guidance_scale=unconditional_guidance_scale,
-            unconditional_conditioning=uc,
-            eta=ddim_eta,
-            cfg_img=None,
-            mask=cond_mask,
-            x0=cond_z0,
-            fs=fs,
-            timestep_spacing=timestep_spacing,
-            guidance_rescale=guidance_rescale,
-            **kwargs)
+            cond = {"c_concat": [img_cat_cond]}
+    
+        if not text_input:
+            prompts = [""] * batch_size
+        cond_ins_emb = model.get_learned_conditioning(prompts)
+    
+        cond_state_emb = model.state_projector(observation['observation.state'].to(torch.bfloat16))
+        cond_state_emb = cond_state_emb + model.agent_state_pos_emb
+    
+        cond_action_emb = model.action_projector(observation['action'].to(torch.bfloat16))
+        cond_action_emb = cond_action_emb + model.agent_action_pos_emb
+    
+        if not sim_mode:
+            cond_action_emb = torch.zeros_like(cond_action_emb)
+    
+        cond["c_crossattn"] = [
+            torch.cat(
+                [cond_state_emb, cond_action_emb, cond_ins_emb, cond_img_emb],
+                dim=1)
+        ]
+        cond["c_crossattn_action"] = [
+            observation['observation.images.top'].to(torch.bfloat16)[:, :, -model.n_obs_steps_acting:],
+            observation['observation.state'].to(torch.bfloat16)[:, -model.n_obs_steps_acting:],
+            sim_mode,
+            False,
+        ]
+    
+        uc = None
+        kwargs.update({"unconditional_conditioning_img_nonetext": None})
+        cond_mask = None
+        cond_z0 = None
+        if ddim_sampler is not None:
+            samples, actions, states, intermedia = ddim_sampler.sample(
+                S=ddim_steps,
+                conditioning=cond,
+                batch_size=batch_size,
+                shape=noise_shape[1:],
+                verbose=False,
+                unconditional_guidance_scale=unconditional_guidance_scale,
+                unconditional_conditioning=uc,
+                eta=ddim_eta,
+                cfg_img=None,
+                mask=cond_mask,
+                x0=cond_z0,
+                fs=fs,
+                timestep_spacing=timestep_spacing,
+                guidance_rescale=guidance_rescale,
+                **kwargs)
 
         # Reconstruct from latent to pixel space
-        batch_images = model.decode_first_stage(samples)
+        batch_images = model.decode_first_stage(samples.to(torch.float32))
         batch_variants = batch_images
 
     return batch_variants, actions, states
@@ -471,12 +473,24 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     print(">>> Dataset is successfully loaded ...")
 
     model = model.cuda(gpu_no)
-    device = get_device_from_parameters(model)
+    
+    # NEW: Hybrid Precision Setup
+    model.half()
+   
+    for b in model.buffers():
+        b.data = b.data.to(torch.float32)
 
+    if hasattr(model, "first_stage_model"):
+        # The VAE decoder is the most sensitive part for PSNR
+        model.first_stage_model.to(torch.float32)
+    
+    device = get_device_from_parameters(model)
+    
     # Run over data
-    assert (args.height % 16 == 0) and (
-        args.width % 16
-        == 0), "Error: image size [h,w] should be multiples of 16!"
+    assert (args.height % 16 == 0
+            ) and (
+            args.width % 16 == 0
+            ), "Error: image size [h,w] should be multiples of 16!"
     assert args.bs == 1, "Current implementation only support [batch size = 1]!"
 
     # Get latent noise shape
