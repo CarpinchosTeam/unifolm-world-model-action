@@ -91,11 +91,8 @@ class CrossAttention(nn.Module):
             (q, k, v),
         )
         # actually compute the attention, what we cannot get enough of
-        out = xformers.ops.memory_efficient_attention(q,
-                                                      k,
-                                                      v,
-                                                      attn_bias=None,
-                                                      op=None)
+        from unifolm_wma.modules.attention import flash_attention
+        out = flash_attention(q, k, v)
         out = (out.unsqueeze(0).reshape(
             b, self.heads, out.shape[1],
             self.dim_head).permute(0, 2, 1,

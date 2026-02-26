@@ -1,3 +1,23 @@
+try:
+    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
+def flash_attention(q, k, v, attn_mask=None):
+    """
+    Compute attention using flash-attn v2. Assumes q, k, v are shaped (batch*heads, seq, dim_head).
+    """
+    import torch
+    # flash-attn expects q, k, v to be contiguous and float16 or bfloat16
+    q, k, v = [t.contiguous() for t in (q, k, v)]
+    dtype = q.dtype
+    assert dtype in (torch.float16, torch.bfloat16), "flash-attn requires fp16 or bf16"
+    # Pack q, k, v for flash-attn: (batch*heads, seq, 3, dim_head)
+    qkv = torch.stack([q, k, v], dim=2)
+    # attn_mask is ignored for now (flash-attn v2 does not support arbitrary masks)
+    out = flash_attn_qkvpacked_func(qkv, causal=False)
+    return out
 import torch
 import torch.nn.functional as F
 
@@ -6,11 +26,9 @@ from einops import rearrange, repeat
 from functools import partial
 
 try:
-    import xformers
-    import xformers.ops
-    XFORMERS_IS_AVAILBLE = True
+    pass  # xformers import removed for flash-attn migration
 except:
-    XFORMERS_IS_AVAILBLE = False
+    pass
 
 from unifolm_wma.utils.common import (
     checkpoint,
@@ -292,11 +310,7 @@ class CrossAttention(nn.Module):
                         b * self.heads, t.shape[1], self.dim_head).contiguous(),
                 (k, v),
             )
-            out = xformers.ops.memory_efficient_attention(q,
-                                                          k,
-                                                          v,
-                                                          attn_bias=None,
-                                                          op=None)
+            out = flash_attention(q, k, v)
             out = (out.unsqueeze(0).reshape(
                 b, self.heads, out.shape[1],
                 self.dim_head).permute(0, 2, 1,
@@ -312,11 +326,7 @@ class CrossAttention(nn.Module):
                         ),
                 (k_ip, v_ip),
             )
-            out_ip = xformers.ops.memory_efficient_attention(q,
-                                                             k_ip,
-                                                             v_ip,
-                                                             attn_bias=None,
-                                                             op=None)
+            out_ip = flash_attention(q, k_ip, v_ip)
             out_ip = (out_ip.unsqueeze(0).reshape(
                 b, self.heads, out_ip.shape[1],
                 self.dim_head).permute(0, 2, 1,
@@ -332,11 +342,7 @@ class CrossAttention(nn.Module):
                         ),
                 (k_as, v_as),
             )
-            out_as = xformers.ops.memory_efficient_attention(q,
-                                                             k_as,
-                                                             v_as,
-                                                             attn_bias=None,
-                                                             op=None)
+            out_as = flash_attention(q, k_as, v_as)
             out_as = (out_as.unsqueeze(0).reshape(
                 b, self.heads, out_as.shape[1],
                 self.dim_head).permute(0, 2, 1,
@@ -356,8 +362,8 @@ class CrossAttention(nn.Module):
                     b * self.heads, attn_mask_aa.shape[1], attn_mask_aa.shape[2])
             attn_mask_aa = attn_mask_aa.to(q.dtype)
 
-            out_aa = xformers.ops.memory_efficient_attention(
-                q, k_aa, v_aa, attn_bias=attn_mask_aa, op=None)
+            # flash-attn v2 does not support arbitrary masks; ignoring attn_mask_aa
+            out_aa = flash_attention(q, k_aa, v_aa)
 
             out_aa = (out_aa.unsqueeze(0).reshape(
                 b, self.heads, out_aa.shape[1],
