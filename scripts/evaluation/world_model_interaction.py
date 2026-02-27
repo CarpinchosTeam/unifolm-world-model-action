@@ -805,6 +805,7 @@ if __name__ == '__main__':
     parser = get_parser()
     args = parser.parse_args()
     seed = args.seed
+    torch.set_float32_matmul_precision('high')
     if seed < 0:
         seed = random.randint(0, 2**31)
     seed_everything(seed)
