@@ -16,6 +16,7 @@ class DDIMSampler(object):
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
         self.counter = 0
+        self._schedule_cache = {}
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -28,6 +29,27 @@ class DDIMSampler(object):
                       ddim_discretize="uniform",
                       ddim_eta=0.,
                       verbose=True):
+        cache_key = (ddim_num_steps, ddim_discretize, ddim_eta)
+        if cache_key in self._schedule_cache:
+            cached = self._schedule_cache[cache_key]
+            self.ddim_timesteps = cached['ddim_timesteps']
+            if self.model.use_dynamic_rescale:
+                self.ddim_scale_arr = cached['ddim_scale_arr']
+                self.ddim_scale_arr_prev = cached['ddim_scale_arr_prev']
+            self.betas = cached['betas']
+            self.alphas_cumprod = cached['alphas_cumprod']
+            self.alphas_cumprod_prev = cached['alphas_cumprod_prev']
+            self.sqrt_alphas_cumprod = cached['sqrt_alphas_cumprod']
+            self.sqrt_one_minus_alphas_cumprod = cached['sqrt_one_minus_alphas_cumprod']
+            self.log_one_minus_alphas_cumprod = cached['log_one_minus_alphas_cumprod']
+            self.sqrt_recip_alphas_cumprod = cached['sqrt_recip_alphas_cumprod']
+            self.sqrt_recipm1_alphas_cumprod = cached['sqrt_recipm1_alphas_cumprod']
+            self.ddim_sigmas = cached['ddim_sigmas']
+            self.ddim_alphas = cached['ddim_alphas']
+            self.ddim_alphas_prev = cached['ddim_alphas_prev']
+            self.ddim_sqrt_one_minus_alphas = cached['ddim_sqrt_one_minus_alphas']
+            self.ddim_sigmas_for_original_num_steps = cached['ddim_sigmas_for_original_num_steps']
+            return
         self.ddim_timesteps = make_ddim_timesteps(
             ddim_discr_method=ddim_discretize,
             num_ddim_timesteps=ddim_num_steps,
@@ -36,8 +58,7 @@ class DDIMSampler(object):
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[
             0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
-        to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model
-                                                                     .device)
+        to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
 
         if self.model.use_dynamic_rescale:
             self.ddim_scale_arr = self.model.scale_arr[self.ddim_timesteps]
@@ -77,6 +98,25 @@ class DDIMSampler(object):
             (1 - self.alphas_cumprod / self.alphas_cumprod_prev))
         self.register_buffer('ddim_sigmas_for_original_num_steps',
                              sigmas_for_original_sampling_steps)
+        # Cache all relevant buffers
+        self._schedule_cache[cache_key] = {
+            'ddim_timesteps': self.ddim_timesteps,
+            'ddim_scale_arr': getattr(self, 'ddim_scale_arr', None),
+            'ddim_scale_arr_prev': getattr(self, 'ddim_scale_arr_prev', None),
+            'betas': self.betas,
+            'alphas_cumprod': self.alphas_cumprod,
+            'alphas_cumprod_prev': self.alphas_cumprod_prev,
+            'sqrt_alphas_cumprod': self.sqrt_alphas_cumprod,
+            'sqrt_one_minus_alphas_cumprod': self.sqrt_one_minus_alphas_cumprod,
+            'log_one_minus_alphas_cumprod': self.log_one_minus_alphas_cumprod,
+            'sqrt_recip_alphas_cumprod': self.sqrt_recip_alphas_cumprod,
+            'sqrt_recipm1_alphas_cumprod': self.sqrt_recipm1_alphas_cumprod,
+            'ddim_sigmas': self.ddim_sigmas,
+            'ddim_alphas': self.ddim_alphas,
+            'ddim_alphas_prev': self.ddim_alphas_prev,
+            'ddim_sqrt_one_minus_alphas': self.ddim_sqrt_one_minus_alphas,
+            'ddim_sigmas_for_original_num_steps': self.ddim_sigmas_for_original_num_steps,
+        }
 
     @torch.no_grad()
     def sample(
