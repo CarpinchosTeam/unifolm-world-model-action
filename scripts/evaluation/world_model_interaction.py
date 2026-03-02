@@ -574,20 +574,21 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
 
                 # Use world-model in policy to generate action
                 print(f'>>> Step {itr}: generating actions ...')
-                pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
-                    model,
-                    sample['instruction'],
-                    observation,
-                    noise_shape,
-                    action_cond_step=args.exe_steps,
-                    ddim_steps=args.ddim_steps,
-                    ddim_eta=args.ddim_eta,
-                    unconditional_guidance_scale=args.
-                    unconditional_guidance_scale,
-                    fs=model_input_fs,
-                    timestep_spacing=args.timestep_spacing,
-                    guidance_rescale=args.guidance_rescale,
-                    sim_mode=False)
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
+                        model,
+                        sample['instruction'],
+                        observation,
+                        noise_shape,
+                        action_cond_step=args.exe_steps,
+                        ddim_steps=args.ddim_steps,
+                        ddim_eta=args.ddim_eta,
+                        unconditional_guidance_scale=args.
+                        unconditional_guidance_scale,
+                        fs=model_input_fs,
+                        timestep_spacing=args.timestep_spacing,
+                        guidance_rescale=args.guidance_rescale,
+                        sim_mode=False)
 
                 # Update future actions in the observation queues
                 for idx in range(len(pred_actions[0])):
@@ -615,20 +616,21 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
 
                 # Interaction with the world-model
                 print(f'>>> Step {itr}: interacting with world model ...')
-                pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
-                    model,
-                    "",
-                    observation,
-                    noise_shape,
-                    action_cond_step=args.exe_steps,
-                    ddim_steps=args.ddim_steps,
-                    ddim_eta=args.ddim_eta,
-                    unconditional_guidance_scale=args.
-                    unconditional_guidance_scale,
-                    fs=model_input_fs,
-                    text_input=False,
-                    timestep_spacing=args.timestep_spacing,
-                    guidance_rescale=args.guidance_rescale)
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
+                        model,
+                        "",
+                        observation,
+                        noise_shape,
+                        action_cond_step=args.exe_steps,
+                        ddim_steps=args.ddim_steps,
+                        ddim_eta=args.ddim_eta,
+                        unconditional_guidance_scale=args.
+                        unconditional_guidance_scale,
+                        fs=model_input_fs,
+                        text_input=False,
+                        timestep_spacing=args.timestep_spacing,
+                        guidance_rescale=args.guidance_rescale)
 
                 for idx in range(args.exe_steps):
                     observation = {
