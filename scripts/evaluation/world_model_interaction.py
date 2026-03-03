@@ -487,199 +487,200 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     noise_shape = [args.bs, channels, n_frames, h, w]
 
     # Start inference
-    for idx in range(0, len(df)):
-        sample = df.iloc[idx]
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        for idx in range(0, len(df)):
+            sample = df.iloc[idx]
 
-        # Got initial frame path
-        init_frame_path = get_init_frame_path(args.prompt_dir, sample)
-        ori_fps = float(sample['fps'])
+            # Got initial frame path
+            init_frame_path = get_init_frame_path(args.prompt_dir, sample)
+            ori_fps = float(sample['fps'])
 
-        video_save_dir = args.savedir + f"/inference/sample_{sample['videoid']}"
-        os.makedirs(video_save_dir, exist_ok=True)
-        os.makedirs(video_save_dir + '/dm', exist_ok=True)
-        os.makedirs(video_save_dir + '/wm', exist_ok=True)
+            video_save_dir = args.savedir + f"/inference/sample_{sample['videoid']}"
+            os.makedirs(video_save_dir, exist_ok=True)
+            os.makedirs(video_save_dir + '/dm', exist_ok=True)
+            os.makedirs(video_save_dir + '/wm', exist_ok=True)
 
-        # Load transitions to get the initial state later
-        transition_path = get_transition_path(args.prompt_dir, sample)
-        with h5py.File(transition_path, 'r') as h5f:
-            transition_dict = {}
-            for key in h5f.keys():
-                transition_dict[key] = torch.tensor(h5f[key][()])
-            for key in h5f.attrs.keys():
-                transition_dict[key] = h5f.attrs[key]
+            # Load transitions to get the initial state later
+            transition_path = get_transition_path(args.prompt_dir, sample)
+            with h5py.File(transition_path, 'r') as h5f:
+                transition_dict = {}
+                for key in h5f.keys():
+                    transition_dict[key] = torch.tensor(h5f[key][()])
+                for key in h5f.attrs.keys():
+                    transition_dict[key] = h5f.attrs[key]
 
-        # If many, test various frequence control and world-model generation
-        for fs in args.frame_stride:
+            # If many, test various frequence control and world-model generation
+            for fs in args.frame_stride:
 
-            # For saving imagens in policy
-            sample_save_dir = f'{video_save_dir}/dm/{fs}'
-            os.makedirs(sample_save_dir, exist_ok=True)
-            # For saving environmental changes in world-model
-            sample_save_dir = f'{video_save_dir}/wm/{fs}'
-            os.makedirs(sample_save_dir, exist_ok=True)
-            # For collecting interaction videos
-            wm_video = []
-            # Initialize observation queues
-            cond_obs_queues = {
-                "observation.images.top":
-                deque(maxlen=model.n_obs_steps_imagen),
-                "observation.state": deque(maxlen=model.n_obs_steps_imagen),
-                "action": deque(maxlen=args.video_length),
-            }
-            # Obtain initial frame and state
-            start_idx = 0
-            model_input_fs = ori_fps // fs
-            batch, ori_state_dim, ori_action_dim = prepare_init_input(
-                start_idx,
-                init_frame_path,
-                transition_dict,
-                fs,
-                data.test_datasets[args.dataset],
-                n_obs_steps=model.n_obs_steps_imagen)
-            observation = {
-                'observation.images.top':
-                batch['observation.image'].permute(1, 0, 2,
-                                                   3)[-1].unsqueeze(0),
-                'observation.state':
-                batch['observation.state'][-1].unsqueeze(0),
-                'action':
-                torch.zeros_like(batch['action'][-1]).unsqueeze(0)
-            }
-            observation = {
-                key: observation[key].to(device, non_blocking=True)
-                for key in observation
-            }
-            # Update observation queues
-            cond_obs_queues = populate_queues(cond_obs_queues, observation)
-
-            # Multi-round interaction with the world-model
-            for itr in tqdm(range(args.n_iter)):
-
-                # Get observation
+                # For saving imagens in policy
+                sample_save_dir = f'{video_save_dir}/dm/{fs}'
+                os.makedirs(sample_save_dir, exist_ok=True)
+                # For saving environmental changes in world-model
+                sample_save_dir = f'{video_save_dir}/wm/{fs}'
+                os.makedirs(sample_save_dir, exist_ok=True)
+                # For collecting interaction videos
+                wm_video = []
+                # Initialize observation queues
+                cond_obs_queues = {
+                    "observation.images.top":
+                    deque(maxlen=model.n_obs_steps_imagen),
+                    "observation.state": deque(maxlen=model.n_obs_steps_imagen),
+                    "action": deque(maxlen=args.video_length),
+                }
+                # Obtain initial frame and state
+                start_idx = 0
+                model_input_fs = ori_fps // fs
+                batch, ori_state_dim, ori_action_dim = prepare_init_input(
+                    start_idx,
+                    init_frame_path,
+                    transition_dict,
+                    fs,
+                    data.test_datasets[args.dataset],
+                    n_obs_steps=model.n_obs_steps_imagen)
                 observation = {
                     'observation.images.top':
-                    torch.stack(list(
-                        cond_obs_queues['observation.images.top']),
-                                dim=1).permute(0, 2, 1, 3, 4),
+                    batch['observation.image'].permute(1, 0, 2,
+                                                    3)[-1].unsqueeze(0),
                     'observation.state':
-                    torch.stack(list(cond_obs_queues['observation.state']),
-                                dim=1),
+                    batch['observation.state'][-1].unsqueeze(0),
                     'action':
-                    torch.stack(list(cond_obs_queues['action']), dim=1),
+                    torch.zeros_like(batch['action'][-1]).unsqueeze(0)
                 }
                 observation = {
                     key: observation[key].to(device, non_blocking=True)
                     for key in observation
                 }
+                # Update observation queues
+                cond_obs_queues = populate_queues(cond_obs_queues, observation)
 
-                # Use world-model in policy to generate action
-                print(f'>>> Step {itr}: generating actions ...')
-                pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
-                    model,
-                    sample['instruction'],
-                    observation,
-                    noise_shape,
-                    action_cond_step=args.exe_steps,
-                    ddim_steps=args.ddim_steps,
-                    ddim_eta=args.ddim_eta,
-                    unconditional_guidance_scale=args.
-                    unconditional_guidance_scale,
-                    fs=model_input_fs,
-                    timestep_spacing=args.timestep_spacing,
-                    guidance_rescale=args.guidance_rescale,
-                    sim_mode=False)
+                # Multi-round interaction with the world-model
+                for itr in tqdm(range(args.n_iter)):
 
-                # Update future actions in the observation queues
-                for idx in range(len(pred_actions[0])):
-                    observation = {'action': pred_actions[0][idx:idx + 1]}
-                    observation['action'][:, ori_action_dim:] = 0.0
-                    cond_obs_queues = populate_queues(cond_obs_queues,
-                                                      observation)
-
-                # Collect data for interacting the world-model using the predicted actions
-                observation = {
-                    'observation.images.top':
-                    torch.stack(list(
-                        cond_obs_queues['observation.images.top']),
-                                dim=1).permute(0, 2, 1, 3, 4),
-                    'observation.state':
-                    torch.stack(list(cond_obs_queues['observation.state']),
-                                dim=1),
-                    'action':
-                    torch.stack(list(cond_obs_queues['action']), dim=1),
-                }
-                observation = {
-                    key: observation[key].to(device, non_blocking=True)
-                    for key in observation
-                }
-
-                # Interaction with the world-model
-                print(f'>>> Step {itr}: interacting with world model ...')
-                pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
-                    model,
-                    "",
-                    observation,
-                    noise_shape,
-                    action_cond_step=args.exe_steps,
-                    ddim_steps=args.ddim_steps,
-                    ddim_eta=args.ddim_eta,
-                    unconditional_guidance_scale=args.
-                    unconditional_guidance_scale,
-                    fs=model_input_fs,
-                    text_input=False,
-                    timestep_spacing=args.timestep_spacing,
-                    guidance_rescale=args.guidance_rescale)
-
-                for idx in range(args.exe_steps):
+                    # Get observation
                     observation = {
                         'observation.images.top':
-                        pred_videos_1[0][:, idx:idx + 1].permute(1, 0, 2, 3),
+                        torch.stack(list(
+                            cond_obs_queues['observation.images.top']),
+                                    dim=1).permute(0, 2, 1, 3, 4),
                         'observation.state':
-                        torch.zeros_like(pred_states[0][idx:idx + 1]) if
-                        args.zero_pred_state else pred_states[0][idx:idx + 1],
+                        torch.stack(list(cond_obs_queues['observation.state']),
+                                    dim=1),
                         'action':
-                        torch.zeros_like(pred_actions[0][-1:])
+                        torch.stack(list(cond_obs_queues['action']), dim=1),
                     }
-                    observation['observation.state'][:, ori_state_dim:] = 0.0
-                    cond_obs_queues = populate_queues(cond_obs_queues,
-                                                      observation)
+                    observation = {
+                        key: observation[key].to(device, non_blocking=True)
+                        for key in observation
+                    }
 
-                # Save the imagen videos for decision-making
-                sample_tag = f"{args.dataset}-vid{sample['videoid']}-dm-fs-{fs}/itr-{itr}"
+                    # Use world-model in policy to generate action
+                    print(f'>>> Step {itr}: generating actions ...')
+                    pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
+                        model,
+                        sample['instruction'],
+                        observation,
+                        noise_shape,
+                        action_cond_step=args.exe_steps,
+                        ddim_steps=args.ddim_steps,
+                        ddim_eta=args.ddim_eta,
+                        unconditional_guidance_scale=args.
+                        unconditional_guidance_scale,
+                        fs=model_input_fs,
+                        timestep_spacing=args.timestep_spacing,
+                        guidance_rescale=args.guidance_rescale,
+                        sim_mode=False)
+
+                    # Update future actions in the observation queues
+                    for idx in range(len(pred_actions[0])):
+                        observation = {'action': pred_actions[0][idx:idx + 1]}
+                        observation['action'][:, ori_action_dim:] = 0.0
+                        cond_obs_queues = populate_queues(cond_obs_queues,
+                                                        observation)
+
+                    # Collect data for interacting the world-model using the predicted actions
+                    observation = {
+                        'observation.images.top':
+                        torch.stack(list(
+                            cond_obs_queues['observation.images.top']),
+                                    dim=1).permute(0, 2, 1, 3, 4),
+                        'observation.state':
+                        torch.stack(list(cond_obs_queues['observation.state']),
+                                    dim=1),
+                        'action':
+                        torch.stack(list(cond_obs_queues['action']), dim=1),
+                    }
+                    observation = {
+                        key: observation[key].to(device, non_blocking=True)
+                        for key in observation
+                    }
+
+                    # Interaction with the world-model
+                    print(f'>>> Step {itr}: interacting with world model ...')
+                    pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
+                        model,
+                        "",
+                        observation,
+                        noise_shape,
+                        action_cond_step=args.exe_steps,
+                        ddim_steps=args.ddim_steps,
+                        ddim_eta=args.ddim_eta,
+                        unconditional_guidance_scale=args.
+                        unconditional_guidance_scale,
+                        fs=model_input_fs,
+                        text_input=False,
+                        timestep_spacing=args.timestep_spacing,
+                        guidance_rescale=args.guidance_rescale)
+
+                    for idx in range(args.exe_steps):
+                        observation = {
+                            'observation.images.top':
+                            pred_videos_1[0][:, idx:idx + 1].permute(1, 0, 2, 3),
+                            'observation.state':
+                            torch.zeros_like(pred_states[0][idx:idx + 1]) if
+                            args.zero_pred_state else pred_states[0][idx:idx + 1],
+                            'action':
+                            torch.zeros_like(pred_actions[0][-1:])
+                        }
+                        observation['observation.state'][:, ori_state_dim:] = 0.0
+                        cond_obs_queues = populate_queues(cond_obs_queues,
+                                                        observation)
+
+                    # Save the imagen videos for decision-making
+                    sample_tag = f"{args.dataset}-vid{sample['videoid']}-dm-fs-{fs}/itr-{itr}"
+                    log_to_tensorboard(writer,
+                                    pred_videos_0,
+                                    sample_tag,
+                                    fps=args.save_fps)
+                    # Save videos environment changes via world-model interaction
+                    sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/itr-{itr}"
+                    log_to_tensorboard(writer,
+                                    pred_videos_1,
+                                    sample_tag,
+                                    fps=args.save_fps)
+
+                    # Save the imagen videos for decision-making
+                    sample_video_file = f'{video_save_dir}/dm/{fs}/itr-{itr}.mp4'
+                    save_results(pred_videos_0.cpu(),
+                                sample_video_file,
+                                fps=args.save_fps)
+                    # Save videos environment changes via world-model interaction
+                    sample_video_file = f'{video_save_dir}/wm/{fs}/itr-{itr}.mp4'
+                    save_results(pred_videos_1.cpu(),
+                                sample_video_file,
+                                fps=args.save_fps)
+
+                    print('>' * 24)
+                    # Collect the result of world-model interactions
+                    wm_video.append(pred_videos_1[:, :, :args.exe_steps].cpu())
+
+                full_video = torch.cat(wm_video, dim=2)
+                sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/full"
                 log_to_tensorboard(writer,
-                                   pred_videos_0,
-                                   sample_tag,
-                                   fps=args.save_fps)
-                # Save videos environment changes via world-model interaction
-                sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/itr-{itr}"
-                log_to_tensorboard(writer,
-                                   pred_videos_1,
-                                   sample_tag,
-                                   fps=args.save_fps)
-
-                # Save the imagen videos for decision-making
-                sample_video_file = f'{video_save_dir}/dm/{fs}/itr-{itr}.mp4'
-                save_results(pred_videos_0.cpu(),
-                             sample_video_file,
-                             fps=args.save_fps)
-                # Save videos environment changes via world-model interaction
-                sample_video_file = f'{video_save_dir}/wm/{fs}/itr-{itr}.mp4'
-                save_results(pred_videos_1.cpu(),
-                             sample_video_file,
-                             fps=args.save_fps)
-
-                print('>' * 24)
-                # Collect the result of world-model interactions
-                wm_video.append(pred_videos_1[:, :, :args.exe_steps].cpu())
-
-            full_video = torch.cat(wm_video, dim=2)
-            sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/full"
-            log_to_tensorboard(writer,
-                               full_video,
-                               sample_tag,
-                               fps=args.save_fps)
-            sample_full_video_file = f"{video_save_dir}/../{sample['videoid']}_full_fs{fs}.mp4"
-            save_results(full_video, sample_full_video_file, fps=args.save_fps)
+                                full_video,
+                                sample_tag,
+                                fps=args.save_fps)
+                sample_full_video_file = f"{video_save_dir}/../{sample['videoid']}_full_fs{fs}.mp4"
+                save_results(full_video, sample_full_video_file, fps=args.save_fps)
 
 
 def get_parser():
