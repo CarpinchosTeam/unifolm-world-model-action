@@ -23,7 +23,7 @@ conda install ffmpeg=7.1.1 -c conda-forge
 
 ### Install xFormers
 pip install ninja
-pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm7.1
 pip3 install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1
 
 cd "${MAIN_DIR}"
@@ -32,6 +32,5 @@ pip install -e .
 cd external/dlimp
 pip install -e .
 cd ../../..
-
 
 echo "Branch-specific setup complete."
