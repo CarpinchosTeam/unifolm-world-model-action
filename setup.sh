@@ -14,18 +14,16 @@ conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/ma
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 
 if ! conda info --envs | grep -q "unifolm-wma"; then
-    conda create --yes -n ${REPO_BRANCH} python=3.10.19
+    conda create --yes -n unifolm-wma-${REPO_BRANCH} python=3.10.19
 fi
 
-conda activate ${REPO_BRANCH}
+conda activate unifolm-wma-${REPO_BRANCH}
 
 conda install pinocchio=3.2.0 -c conda-forge -y
 conda install ffmpeg=7.1.1 -c conda-forge
 
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.0
-
-pip install psutil ninja
-pip install flash-attn --no-build-isolation
+pip install ninja
+pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm7.1
 
 cd ${MAIN_DIR}
 git submodule update --init --recursive

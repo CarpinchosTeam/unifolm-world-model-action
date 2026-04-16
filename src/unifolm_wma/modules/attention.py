@@ -1,23 +1,3 @@
-try:
-    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func
-    FLASH_ATTN_AVAILABLE = True
-except ImportError:
-    FLASH_ATTN_AVAILABLE = False
-
-def flash_attention(q, k, v, attn_mask=None):
-    """
-    Compute attention using flash-attn v2. Assumes q, k, v are shaped (batch*heads, seq, dim_head).
-    """
-    import torch
-    # flash-attn expects q, k, v to be contiguous and float16 or bfloat16
-    q, k, v = [t.contiguous() for t in (q, k, v)]
-    dtype = q.dtype
-    assert dtype in (torch.float16, torch.bfloat16), "flash-attn requires fp16 or bf16"
-    # Pack q, k, v for flash-attn: (batch*heads, seq, 3, dim_head)
-    qkv = torch.stack([q, k, v], dim=2)
-    # attn_mask is ignored for now (flash-attn v2 does not support arbitrary masks)
-    out = flash_attn_qkvpacked_func(qkv, causal=False)
-    return out
 import torch
 import torch.nn.functional as F
 
@@ -26,9 +6,11 @@ from einops import rearrange, repeat
 from functools import partial
 
 try:
-    pass  # xformers import removed for flash-attn migration
+    import xformers
+    import xformers.ops
+    XFORMERS_IS_AVAILBLE = True
 except:
-    pass
+    XFORMERS_IS_AVAILBLE = False
 
 from unifolm_wma.utils.common import (
     checkpoint,
@@ -143,7 +125,6 @@ class CrossAttention(nn.Module):
         context = default(context, x)
 
         if self.image_cross_attention and not spatial_self_attn:
-            assert 1 > 2, ">>> ERROR: should setup xformers and use efficient_forward ..."
             context_agent_state = context[:, :self.agent_state_context_len, :]
             context_agent_action = context[:,
                                            self.agent_state_context_len:self.
@@ -302,74 +283,42 @@ class CrossAttention(nn.Module):
             v = self.to_v(context)
 
         b, _, _ = q.shape
-        q = q.unsqueeze(3).reshape(b, q.shape[1], self.heads, self.dim_head).permute(0, 2, 1, 3).reshape(b * self.heads, q.shape[1], self.dim_head).contiguous()
+
+        # Reshape helpers for scaled_dot_product_attention (b, heads, seq, dim_head)
+        def reshape_for_sdpa(t):
+            return t.unsqueeze(3).reshape(
+                b, t.shape[1], self.heads, self.dim_head
+            ).permute(0, 2, 1, 3).contiguous()
+
+        def reshape_from_sdpa(t):
+            return t.permute(0, 2, 1, 3).reshape(b, t.shape[2], self.heads * self.dim_head)
+
+        q = reshape_for_sdpa(q)
         if k is not None:
-            k, v = map(
-                lambda t: t.unsqueeze(3).reshape(b, t.shape[
-                    1], self.heads, self.dim_head).permute(0, 2, 1, 3).reshape(
-                        b * self.heads, t.shape[1], self.dim_head).contiguous(),
-                (k, v),
-            )
-            out = flash_attention(q, k, v)
-            out = (out.unsqueeze(0).reshape(
-                b, self.heads, out.shape[1],
-                self.dim_head).permute(0, 2, 1,
-                                       3).reshape(b, out.shape[1],
-                                                  self.heads * self.dim_head))
+            k, v = map(reshape_for_sdpa, (k, v))
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=None)
+            out = reshape_from_sdpa(out)
 
         if k_ip is not None:
             # For image cross-attention
-            k_ip, v_ip = map(
-                lambda t: t.unsqueeze(3).reshape(b, t.shape[
-                    1], self.heads, self.dim_head).permute(0, 2, 1, 3).reshape(
-                        b * self.heads, t.shape[1], self.dim_head).contiguous(
-                        ),
-                (k_ip, v_ip),
-            )
-            out_ip = flash_attention(q, k_ip, v_ip)
-            out_ip = (out_ip.unsqueeze(0).reshape(
-                b, self.heads, out_ip.shape[1],
-                self.dim_head).permute(0, 2, 1,
-                                       3).reshape(b, out_ip.shape[1],
-                                                  self.heads * self.dim_head))
+            k_ip, v_ip = map(reshape_for_sdpa, (k_ip, v_ip))
+            out_ip = F.scaled_dot_product_attention(q, k_ip, v_ip, attn_mask=None)
+            out_ip = reshape_from_sdpa(out_ip)
 
         if k_as is not None:
             # For agent state cross-attention
-            k_as, v_as = map(
-                lambda t: t.unsqueeze(3).reshape(b, t.shape[
-                    1], self.heads, self.dim_head).permute(0, 2, 1, 3).reshape(
-                        b * self.heads, t.shape[1], self.dim_head).contiguous(
-                        ),
-                (k_as, v_as),
-            )
-            out_as = flash_attention(q, k_as, v_as)
-            out_as = (out_as.unsqueeze(0).reshape(
-                b, self.heads, out_as.shape[1],
-                self.dim_head).permute(0, 2, 1,
-                                       3).reshape(b, out_as.shape[1],
-                                                  self.heads * self.dim_head))
+            k_as, v_as = map(reshape_for_sdpa, (k_as, v_as))
+            out_as = F.scaled_dot_product_attention(q, k_as, v_as, attn_mask=None)
+            out_as = reshape_from_sdpa(out_as)
         if k_aa is not None:
-            # For agent action cross-attention
-            k_aa, v_aa = map(
-                lambda t: t.unsqueeze(3).reshape(b, t.shape[
-                    1], self.heads, self.dim_head).permute(0, 2, 1, 3).reshape(
-                        b * self.heads, t.shape[1], self.dim_head).contiguous(
-                        ),
-                (k_aa, v_aa),
-            )
-
-            attn_mask_aa = attn_mask_aa.unsqueeze(1).repeat(1,self.heads,1,1).reshape(
-                    b * self.heads, attn_mask_aa.shape[1], attn_mask_aa.shape[2])
-            attn_mask_aa = attn_mask_aa.to(q.dtype)
-
-            # flash-attn v2 does not support arbitrary masks; ignoring attn_mask_aa
-            out_aa = flash_attention(q, k_aa, v_aa)
-
-            out_aa = (out_aa.unsqueeze(0).reshape(
-                b, self.heads, out_aa.shape[1],
-                self.dim_head).permute(0, 2, 1,
-                                       3).reshape(b, out_aa.shape[1],
-                                                  self.heads * self.dim_head))
+            # For agent action cross-attention — preserve the block-causal mask
+            k_aa, v_aa = map(reshape_for_sdpa, (k_aa, v_aa))
+            # attn_mask_aa is (b, q_len, k_len); expand to (b, heads, q_len, k_len)
+            attn_mask_aa = attn_mask_aa.unsqueeze(1).expand(
+                b, self.heads, attn_mask_aa.shape[1], attn_mask_aa.shape[2]
+            ).to(q.dtype).contiguous()
+            out_aa = F.scaled_dot_product_attention(q, k_aa, v_aa, attn_mask=attn_mask_aa)
+            out_aa = reshape_from_sdpa(out_aa)
         if exists(mask):
             raise NotImplementedError
 
