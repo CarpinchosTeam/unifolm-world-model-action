@@ -6,6 +6,10 @@
 
 set -Eeuo pipefail
 
+[ -z ${FLASH_ATTENTION+x} ] && FLASH_ATTENTION=FALSE
+[ -z ${FLASH_ATTENTION_TRITON_AMD_ENABLE+x} ] && FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE
+
+
 echo "Running branch-specific setup for: $REPO_BRANCH"
 
 eval "$("${CONDA_PATH}/bin/conda" 'shell.bash' 'hook')"
@@ -34,5 +38,18 @@ cd external/dlimp
 pip install -e .
 
 cd ../../..
+
+[ ! -d ./flash-attention ] && git clone https://github.com/Dao-AILab/flash-attention.git flash-attention
+if [ "$FLASH_ATTENTION_TRITON_AMD_ENABLE"=="TRUE" ]; then 
+	AITER_PATH="./flash-attention/third_party/aiter"
+	[ ! -d ${AITER_PATH} ] && rm -rf ${AITER_PATH}    	
+	[ ! -d ${AITER_PATH} ] && git clone https://github.com/ROCm/aiter.git ${AITER_PATH}
+else 
+    [ ! -d ./flash-attention/csrc/composable_kernel ] && git clone https://github.com/ROCm/composable_kernel.git flash-attention/csrc/composable_kernel
+    [ ! -d ./flash-attention/csrc/cutlass ] &&  git clone https://github.com/NVIDIA/cutlass.git flash-attention/csrc/cutlass 
+fi
+cd flash-attention
+	pip install --no-build-isolation .
+cd ..
 
 echo "Branch-specific setup complete."
