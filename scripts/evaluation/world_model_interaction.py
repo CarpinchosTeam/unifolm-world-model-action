@@ -25,6 +25,10 @@ from PIL import Image
 from unifolm_wma.models.samplers.ddim import DDIMSampler
 from unifolm_wma.utils.utils import instantiate_from_config
 
+def print_gpu_mem():
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    print(f"GPU mem: allocated={allocated:.1f}MB, reserved={reserved:.1f}MB")
 
 def get_device_from_parameters(module: nn.Module) -> torch.device:
     """Get a module's device by checking one of its parameters.
@@ -471,7 +475,18 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     print(">>> Dataset is successfully loaded ...")
 
     model = model.cuda(gpu_no)
-    device = get_device_from_parameters(model)
+
+    # --- QUANTIZATION ---
+    print("Before quantization:")
+    print_gpu_mem()
+
+    diffusion_model = model.model.diffusion_model
+    quantize_(diffusion_model, int8_weight_only())
+    print(">>> Quantized diffusion model with int8_weight_only")
+    # --------------------
+
+    print("After quantization:")
+    print_gpu_mem()
 
     # Run over data
     assert (args.height % 16 == 0) and (
