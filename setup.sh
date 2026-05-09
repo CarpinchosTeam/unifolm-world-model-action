@@ -42,8 +42,11 @@ uv pip install --pre \
   torch torchvision \
   --index-url https://download.pytorch.org/whl/nightly/rocm7.1
 
+flashattn_repo="Dao-AILab/flash-attention.git"
 log "Installing flash attention"
-[ ! -d ./flash-attention ] && git clone https://github.com/Dao-AILab/flash-attention.git flash-attention
+[ ! -d ./flash-attention ] && git clone https://github.com/${flashattn_repo} flash-attention
+[ ! -d ./flash-attention ] && git clone https://gitclone/github.com/${flashattn_repo} flash-attention
+[ ! -d ./flash-attention ] && git clone https://hub.fastgit.xyz/${flashattn_repo} flash-attention
 if [ "$FLASH_ATTENTION_TRITON_AMD_ENABLE"=="TRUE" ]; then
   AITER_PATH="./flash-attention/third_party/aiter"
   [ ! -d ${AITER_PATH} ] && rm -rf ${AITER_PATH}
