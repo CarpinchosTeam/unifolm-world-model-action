@@ -39,7 +39,7 @@ conda install ffmpeg=7.1.1 -c conda-forge
 uv pip install ninja
 
 uv pip install --pre \
-  "torch==2.3.1" "torchvision==0.18.1" \
+  torch torchvision \
   --index-url https://download.pytorch.org/whl/nightly/rocm7.1
 
 log "Installing flash attention"
