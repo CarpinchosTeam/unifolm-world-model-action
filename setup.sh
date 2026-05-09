@@ -17,7 +17,7 @@ eval "$("${CONDA_PATH}/bin/conda" 'shell.bash' 'hook')"
 # conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
 # conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 
-if ! conda info --envs | grep -q "unifolm-wma"; then
+if ! conda info --envs | grep -q "unifolm-wma-${REPO_BRANCH}"; then
     conda create --yes -n unifolm-wma-${REPO_BRANCH} python=3.10.19
 fi
 
