@@ -36,8 +36,8 @@ log "Installing Project"
 cd ${MAIN_DIR}
 git submodule update --init --recursive
 
-pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/rocm7.1
-pip3 install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1
+pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+pip install -U xformers --index-url https://download.pytorch.org/whl/rocm7.2
 
 log "Test xformers"
 python -m xformers.info
