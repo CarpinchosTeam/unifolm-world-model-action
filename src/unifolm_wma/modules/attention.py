@@ -1,3 +1,5 @@
+import logging
+import os
 import torch
 import torch.nn.functional as F
 
@@ -5,12 +7,47 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from functools import partial
 
+logger = logging.getLogger(__name__)
+
+# [AMD-ROCm] Check xformers availability
 try:
     import xformers
     import xformers.ops
     XFORMERS_IS_AVAILBLE = True
-except:
+except ImportError:
     XFORMERS_IS_AVAILBLE = False
+
+# [AMD-ROCm] Allow disabling xformers via environment variable for compatibility
+# Set DISABLE_XFORMERS=1 to force PyTorch native attention (useful for gfx1100/RDNA3)
+if os.environ.get('DISABLE_XFORMERS', '0') == '1':
+    if XFORMERS_IS_AVAILBLE:
+        logger.warning("xformers DISABLED via DISABLE_XFORMERS=1 environment variable")
+    XFORMERS_IS_AVAILBLE = False
+
+# [AMD-ROCm] PyTorch native attention fallback when xformers is not available
+def memory_efficient_attention_pytorch(q, k, v, attn_bias=None):
+    """
+    Manual implementation of memory efficient attention using einsum + softmax.
+    This implementation is closer to xformers than PyTorch's scaled_dot_product_attention fallback.
+    Input shape: (batch*heads, seq_len, dim_head)
+    """
+    # Get scale factor
+    scale = q.shape[-1] ** -0.5
+    
+    # Compute attention scores: (batch*heads, seq_len_q, seq_len_k)
+    sim = torch.einsum('b i d, b j d -> b i j', q, k) * scale
+    
+    # Apply attention bias if provided
+    if attn_bias is not None:
+        sim = sim + attn_bias
+    
+    # Softmax
+    attn = F.softmax(sim, dim=-1)
+    
+    # Apply attention to values
+    out = torch.einsum('b i j, b j d -> b i d', attn, v)
+    
+    return out
 
 from unifolm_wma.utils.common import (
     checkpoint,
@@ -87,7 +124,8 @@ class CrossAttention(nn.Module):
                 num_units=dim_head, max_relative_position=temporal_length)
         else:
             ## only used for spatial attention, while NOT for temporal attention
-            if XFORMERS_IS_AVAILBLE and temporal_length is None:
+            # [AMD-ROCm] Always use efficient_forward for spatial attention (works with both xformers and PyTorch native)
+            if temporal_length is None:
                 self.forward = self.efficient_forward
 
         self.video_length = video_length
@@ -292,11 +330,26 @@ class CrossAttention(nn.Module):
                         b * self.heads, t.shape[1], self.dim_head).contiguous(),
                 (k, v),
             )
-            out = xformers.ops.memory_efficient_attention(q,
-                                                          k,
-                                                          v,
-                                                          attn_bias=None,
-                                                          op=None)
+            # [AMD-ROCm] Use xformers if available, otherwise use PyTorch native attention
+            if XFORMERS_IS_AVAILBLE:
+                # xformers ROCm only supports float16/bfloat16, need to convert if float32
+                original_dtype = q.dtype
+                if original_dtype == torch.float32:
+                    if not hasattr(CrossAttention, '_xformers_logged'):
+                        logger.info("xformers ACTIVE: using float16 precision for ROCm compatibility")
+                        CrossAttention._xformers_logged = True
+                    out = xformers.ops.memory_efficient_attention(q.half(), k.half(), v.half(), attn_bias=None, op=None)
+                    out = out.to(original_dtype)
+                else:
+                    if not hasattr(CrossAttention, '_xformers_logged'):
+                        logger.info(f"xformers ACTIVE: using native dtype {q.dtype}")
+                        CrossAttention._xformers_logged = True
+                    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None)
+            else:
+                if not hasattr(CrossAttention, '_fallback_logged'):
+                    logger.info("xformers NOT available, using PyTorch einsum fallback")
+                    CrossAttention._fallback_logged = True
+                out = memory_efficient_attention_pytorch(q, k, v)
             out = (out.unsqueeze(0).reshape(
                 b, self.heads, out.shape[1],
                 self.dim_head).permute(0, 2, 1,
@@ -312,11 +365,17 @@ class CrossAttention(nn.Module):
                         ),
                 (k_ip, v_ip),
             )
-            out_ip = xformers.ops.memory_efficient_attention(q,
-                                                             k_ip,
-                                                             v_ip,
-                                                             attn_bias=None,
-                                                             op=None)
+            # [AMD-ROCm] Use xformers if available, otherwise use PyTorch native attention
+            if XFORMERS_IS_AVAILBLE:
+                # xformers ROCm only supports float16/bfloat16
+                original_dtype = q.dtype
+                if original_dtype == torch.float32:
+                    out_ip = xformers.ops.memory_efficient_attention(q.half(), k_ip.half(), v_ip.half(), attn_bias=None, op=None)
+                    out_ip = out_ip.to(original_dtype)
+                else:
+                    out_ip = xformers.ops.memory_efficient_attention(q, k_ip, v_ip, attn_bias=None, op=None)
+            else:
+                out_ip = memory_efficient_attention_pytorch(q, k_ip, v_ip)
             out_ip = (out_ip.unsqueeze(0).reshape(
                 b, self.heads, out_ip.shape[1],
                 self.dim_head).permute(0, 2, 1,
@@ -332,11 +391,17 @@ class CrossAttention(nn.Module):
                         ),
                 (k_as, v_as),
             )
-            out_as = xformers.ops.memory_efficient_attention(q,
-                                                             k_as,
-                                                             v_as,
-                                                             attn_bias=None,
-                                                             op=None)
+            # [AMD-ROCm] Use xformers if available, otherwise use PyTorch native attention
+            if XFORMERS_IS_AVAILBLE:
+                # xformers ROCm only supports float16/bfloat16
+                original_dtype = q.dtype
+                if original_dtype == torch.float32:
+                    out_as = xformers.ops.memory_efficient_attention(q.half(), k_as.half(), v_as.half(), attn_bias=None, op=None)
+                    out_as = out_as.to(original_dtype)
+                else:
+                    out_as = xformers.ops.memory_efficient_attention(q, k_as, v_as, attn_bias=None, op=None)
+            else:
+                out_as = memory_efficient_attention_pytorch(q, k_as, v_as)
             out_as = (out_as.unsqueeze(0).reshape(
                 b, self.heads, out_as.shape[1],
                 self.dim_head).permute(0, 2, 1,
@@ -356,8 +421,17 @@ class CrossAttention(nn.Module):
                     b * self.heads, attn_mask_aa.shape[1], attn_mask_aa.shape[2])
             attn_mask_aa = attn_mask_aa.to(q.dtype)
 
-            out_aa = xformers.ops.memory_efficient_attention(
-                q, k_aa, v_aa, attn_bias=attn_mask_aa, op=None)
+            # [AMD-ROCm] Use xformers if available, otherwise use PyTorch native attention
+            if XFORMERS_IS_AVAILBLE:
+                # xformers ROCm only supports float16/bfloat16
+                original_dtype = q.dtype
+                if original_dtype == torch.float32:
+                    out_aa = xformers.ops.memory_efficient_attention(q.half(), k_aa.half(), v_aa.half(), attn_bias=attn_mask_aa.half() if attn_mask_aa is not None else None, op=None)
+                    out_aa = out_aa.to(original_dtype)
+                else:
+                    out_aa = xformers.ops.memory_efficient_attention(q, k_aa, v_aa, attn_bias=attn_mask_aa, op=None)
+            else:
+                out_aa = memory_efficient_attention_pytorch(q, k_aa, v_aa, attn_bias=attn_mask_aa)
 
             out_aa = (out_aa.unsqueeze(0).reshape(
                 b, self.heads, out_aa.shape[1],

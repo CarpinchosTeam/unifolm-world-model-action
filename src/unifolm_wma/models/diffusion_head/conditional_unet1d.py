@@ -1,6 +1,8 @@
 import logging
+import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import einops
 
 from einops import rearrange, repeat
@@ -18,6 +20,19 @@ from unifolm_wma.utils.common import (
     default,
 )
 from unifolm_wma.utils.utils import instantiate_from_config
+
+# [AMD-ROCm] Check if xformers is available
+try:
+    import xformers
+    import xformers.ops
+    XFORMERS_IS_AVAILBLE = True
+except:
+    XFORMERS_IS_AVAILBLE = False
+
+# [AMD-ROCm] Allow disabling xformers via environment variable for compatibility
+# Set DISABLE_XFORMERS=1 to force PyTorch native attention (useful for gfx1100/RDNA3)
+if os.environ.get('DISABLE_XFORMERS', '0') == '1':
+    XFORMERS_IS_AVAILBLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +88,10 @@ class CrossAttention(nn.Module):
         self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim),
                                     nn.Dropout(dropout))
 
+    def forward(self, x, context=None, mask=None):
+        """Forward method that delegates to efficient_forward"""
+        return self.efficient_forward(x, context)
+
     def efficient_forward(self, x, context=None):
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
@@ -90,12 +109,21 @@ class CrossAttention(nn.Module):
                     b * self.heads, t.shape[1], self.dim_head).contiguous(),
             (q, k, v),
         )
-        # actually compute the attention, what we cannot get enough of
-        out = xformers.ops.memory_efficient_attention(q,
-                                                      k,
-                                                      v,
-                                                      attn_bias=None,
-                                                      op=None)
+        # [AMD-ROCm] Use xformers if available, otherwise use manual einsum+softmax attention
+        if XFORMERS_IS_AVAILBLE:
+            # xformers ROCm only supports float16/bfloat16, convert if float32
+            original_dtype = q.dtype
+            if original_dtype == torch.float32:
+                out = xformers.ops.memory_efficient_attention(q.half(), k.half(), v.half(), attn_bias=None, op=None)
+                out = out.to(original_dtype)
+            else:
+                out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None)
+        else:
+            # Manual implementation closer to xformers
+            scale = q.shape[-1] ** -0.5
+            sim = torch.einsum('b i d, b j d -> b i j', q, k) * scale
+            attn = F.softmax(sim, dim=-1)
+            out = torch.einsum('b i j, b j d -> b i d', attn, v)
         out = (out.unsqueeze(0).reshape(
             b, self.heads, out.shape[1],
             self.dim_head).permute(0, 2, 1,

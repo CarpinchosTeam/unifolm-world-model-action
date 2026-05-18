@@ -466,6 +466,14 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
 
     # Build unnomalizer
     logging.info("***** Configing Data *****")
+    
+    # [AMD-ROCm] Filter dataset_and_weights to only include current dataset
+    # This is necessary because ASC evaluation data structure differs from training data structure
+    # Each case directory only contains CSV for its own dataset, not all 5 datasets
+    if args.dataset in config.data.params.dataset_and_weights:
+        config.data.params.dataset_and_weights = {args.dataset: 1.0}
+        logging.info(f"Filtered dataset_and_weights to: {args.dataset}")
+    
     data = instantiate_from_config(config.data)
     data.setup()
     print(">>> Dataset is successfully loaded ...")
