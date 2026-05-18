@@ -13,24 +13,20 @@ error() {
 
 set -Eeuo pipefail
 
-#[ -z ${FLASH_ATTENTION+x} ] && FLASH_ATTENTION=FALSE
-#[ -z ${FLASH_ATTENTION_TRITON_AMD_ENABLE+x} ] && FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE
-FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
 PYTORCH_ROCM_ARCH=gfx1100
+WORKING_NAME="unifolm-wma-${REPO_BRANCH}"
 
 log "Running branch-specific setup for: $REPO_BRANCH"
 
-log "Setting up unifolm-wma-${REPO_BRANCH} conda env"
+log "Setting up $WORKING_NAME conda env"
 eval "$("${CONDA_PATH}/bin/conda" 'shell.bash' 'hook')"
 
-# conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-# conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 
-if ! conda info --envs | grep -q "unifolm-wma-${REPO_BRANCH}"; then
-  conda create --yes -n unifolm-wma-${REPO_BRANCH} python=3.10.19
+if ! conda info --envs | grep -q ${WORKING_NAME}; then
+  conda create --yes -n ${WORKING_NAME} python=3.10.18 -y
 fi
 
-conda activate unifolm-wma-${REPO_BRANCH}
+conda activate ${WORKING_NAME}
 
 log "Installing requirements"
 conda install pinocchio=3.2.0 -c conda-forge -y
@@ -40,10 +36,10 @@ log "Installing Project"
 cd ${MAIN_DIR}
 git submodule update --init --recursive
 
-uv pip install -e .
+pip install -e .
 
 cd external/dlimp
-uv pip install -e .
+pip install -e .
 
 cd ../../..
 
