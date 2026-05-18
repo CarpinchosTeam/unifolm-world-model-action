@@ -194,17 +194,17 @@ class DDIMSampler(object):
 
         b = shape[0]
         if x_T is None:
-            img = torch.randn(shape, device=device)
+            img = torch.randn(shape, device='cpu').to(device)
             action = torch.randn((b, 16, self.model.agent_action_dim),
-                                 device=device)
+                                 device='cpu').to(device)
             state = torch.randn((b, 16, self.model.agent_state_dim),
                                 device=device)
         else:
             img = x_T
             action = torch.randn((b, 16, self.model.agent_action_dim),
-                                 device=device)
+                                 device='cpu').to(device)
             state = torch.randn((b, 16, self.model.agent_state_dim),
-                                device=device)
+                                device='cpu').to(device)
 
         if precision is not None:
             if precision == 16:
